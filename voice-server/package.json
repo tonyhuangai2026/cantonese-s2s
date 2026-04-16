@@ -10,8 +10,6 @@
     "@aws-sdk/client-dynamodb": "^3.700.0",
     "@aws-sdk/lib-dynamodb": "^3.700.0",
     "@fastify/cors": "^10.0.0",
-    "@fastify/formbody": "^8.0.0",
-    "@fastify/websocket": "^11.0.0",
     "alawmulaw": "^6.0.0",
     "fastify": "^5.0.0",
     "ws": "^8.18.0"
