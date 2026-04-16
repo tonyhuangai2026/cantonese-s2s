@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cantonese S2S - ECS EC2 deployment with Chime Voice Connector SIP/RTP.
+
+Parameters:
+  ChimeVoiceConnectorHost:
+    Type: String
+    Description: Chime Voice Connector outbound hostname
+  ChimePhoneNumber:
+    Type: String
+    Description: Chime phone number (E.164)
+    Default: ''
+  MiniMaxApiKey:
+    Type: String
+    NoEcho: true
+    Description: MiniMax TTS API key
+  ECSOptimizedAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+  AwsRegion:
+    Type: String
+    Default: us-east-1
+  ImageTag:
+    Type: String
+    Default: latest
+  VoiceId:
+    Type: String
+    Default: "Cantonese_ProfessionalHost（F)"
+  S2SEndpoint:
+    Type: String
+    Default: "ws://localhost:8765/v1/s2s"
+  InstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues: [t3.medium, t3.large, t3.xlarge]
+
+Resources:
+  # ===== Networking =====
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.1.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-vpc"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref VPC, InternetGatewayId: !Ref InternetGateway}
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.1.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref VPC}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties: {RouteTableId: !Ref PublicRouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+
+  SubnetRouteAssoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable}
+
+  SubnetRouteAssoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable}
+
+  # ===== Security Group =====
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} ECS"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 3000, ToPort: 3000, CidrIp: 0.0.0.0/0, Description: "HTTP API"}
+        - {IpProtocol: udp, FromPort: 5060, ToPort: 5060, CidrIp: 0.0.0.0/0, Description: "SIP"}
+        - {IpProtocol: udp, FromPort: 10000, ToPort: 20000, CidrIp: 0.0.0.0/0, Description: "RTP"}
+
+  # ===== Elastic IP (stable for Chime Origination) =====
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties: {Domain: vpc}
+
+  # ===== ECR Repositories =====
+  S2SRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-s2s-service"
+      ImageScanningConfiguration: {ScanOnPush: false}
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":7},"action":{"type":"expire"}}]}'
+
+  VoiceServerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-voice-server"
+      ImageScanningConfiguration: {ScanOnPush: false}
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":7},"action":{"type":"expire"}}]}'
+
+  # ===== ECS Cluster =====
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  # ===== IAM =====
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref EC2InstanceRole]}
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ecs-tasks.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['bedrock:InvokeModel','bedrock:InvokeModelWithResponseStream','bedrock:ConverseStream','bedrock:Converse'], Resource: '*'}
+        - PolicyName: TranscribeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['transcribe:StartStreamTranscription','transcribe:StartStreamTranscriptionWebSocket'], Resource: '*'}
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['dynamodb:PutItem','dynamodb:UpdateItem','dynamodb:GetItem','dynamodb:Query'], Resource: '*'}
+
+  # ===== Auto Scaling Group (single instance with EIP) =====
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ECSOptimizedAMI
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt EC2InstanceProfile.Arn}
+        SecurityGroupIds: [!Ref ECSSecurityGroup]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_TASK_ENI=true >> /etc/ecs/ecs.config
+
+            # Associate Elastic IP
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            ALLOC_ID=${EIP.AllocationId}
+            aws ec2 associate-address --instance-id $INSTANCE_ID --allocation-id $ALLOC_ID --region ${AWS::Region} || true
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-ecs", PropagateAtLaunch: true}]
+
+  # ===== Log Group =====
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: 30
+
+  # ===== ECS Task Definition (2 containers, host network) =====
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}"
+      NetworkMode: host
+      RequiresCompatibilities: [EC2]
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      Cpu: '2048'
+      Memory: '4096'
+      ContainerDefinitions:
+        # Container 1: S2S Service (Python)
+        - Name: s2s-service
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${S2SRepository}:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - {ContainerPort: 8765, HostPort: 8765, Protocol: tcp}
+          Environment:
+            - {Name: PORT, Value: '8765'}
+            - {Name: MINIMAX_API_KEY, Value: !Ref MiniMaxApiKey}
+            - {Name: AWS_DEFAULT_REGION, Value: !Ref AwsRegion}
+            - {Name: MINIMAX_VOICE_ID, Value: !Ref VoiceId}
+            - {Name: MINIMAX_LANGUAGE_BOOST, Value: "Chinese,Yue"}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: s2s-service
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -f http://localhost:8765/health || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+
+        # Container 2: Voice Server (Node.js, SIP/RTP)
+        - Name: voice-server
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${VoiceServerRepository}:${ImageTag}"
+          Essential: true
+          DependsOn:
+            - {ContainerName: s2s-service, Condition: HEALTHY}
+          PortMappings:
+            - {ContainerPort: 3000, HostPort: 3000, Protocol: tcp}
+            - {ContainerPort: 5060, HostPort: 5060, Protocol: udp}
+          Environment:
+            - {Name: PORT, Value: '3000'}
+            - {Name: S2S_ENDPOINT, Value: !Ref S2SEndpoint}
+            - {Name: AWS_DEFAULT_REGION, Value: !Ref AwsRegion}
+            - {Name: VOICE_ID, Value: !Ref VoiceId}
+            - {Name: RTP_PORT_BASE, Value: '10000'}
+            - {Name: RTP_PORT_COUNT, Value: '10000'}
+            - {Name: CHIME_VOICE_CONNECTOR_HOST, Value: !Ref ChimeVoiceConnectorHost}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: voice-server
+          HealthCheck:
+            Command: ["CMD-SHELL", "wget -q -O- http://localhost:3000/health || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+
+  # ===== ECS Service =====
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ASG
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: !Sub "${AWS::StackName}-service"
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: EC2
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+
+Outputs:
+  PublicIP:
+    Description: Elastic IP (use for Chime Voice Connector Origination)
+    Value: !Ref EIP
+
+  SIPEndpoint:
+    Description: SIP endpoint for Chime Origination
+    Value: !Sub "${EIP}:5060"
+
+  HealthCheck:
+    Value: !Sub "http://${EIP}:3000/health"
+
+  ActiveCalls:
+    Value: !Sub "http://${EIP}:3000/api/active-calls"
+
+  ECSCluster:
+    Value: !Ref ECSCluster
+
+  ECSService:
+    Value: !GetAtt ECSService.Name
+
+  S2SRepositoryUri:
+    Value: !GetAtt S2SRepository.RepositoryUri
+
+  VoiceServerRepositoryUri:
+    Value: !GetAtt VoiceServerRepository.RepositoryUri
+
+  ChimeSetup:
+    Description: After deployment, configure Chime Voice Connector
+    Value: !Sub "Add Origination: Host=${EIP}, Port=5060, Protocol=UDP, Priority=1"
+
+  Logs:
+    Value: !Sub "aws logs tail /ecs/${AWS::StackName} --follow --region ${AWS::Region}"
