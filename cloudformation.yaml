@@ -26,11 +26,11 @@ Parameters:
 
   ChimeVoiceConnectorDomain:
     Type: String
-    Default: YOUR_VOICE_CONNECTOR_DOMAIN
+    # No default - provide at deploy time
 
   ChimePhoneNumber:
     Type: String
-    Default: "+1XXXXXXXXXX"
+    # No default - provide at deploy time
 
   GitRepoUrl:
     Type: String
