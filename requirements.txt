@@ -1,0 +1,9 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+websockets>=12.0
+amazon-transcribe==0.6.4
+awscrt==0.26.1
+boto3>=1.35.0
+requests>=2.31.0
+webrtcvad>=2.0.10
+numpy>=1.24.0

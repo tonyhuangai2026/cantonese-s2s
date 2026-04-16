@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cantonese Speech-to-Speech service (Nova Sonic v2 compatible API).
+  Deploys EC2 + Docker, git clone from GitHub, docker build & run.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: c5.xlarge
+    AllowedValues: [t3.large, t3.xlarge, c5.large, c5.xlarge, c5.2xlarge, m5.large, m5.xlarge]
+    Description: EC2 instance type (CPU only, no GPU needed)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet (needs internet access for git clone & API calls)
+
+  MiniMaxApiKey:
+    Type: String
+    NoEcho: true
+    Description: MiniMax TTS API key
+
+  GitRepoUrl:
+    Type: String
+    Default: https://github.com/tonyhuangai2026/cantonese-s2s.git
+    Description: Git repo URL containing the source code
+
+  ServicePort:
+    Type: Number
+    Default: 8765
+    Description: WebSocket service port
+
+  TranscribeLanguage:
+    Type: String
+    Default: zh-HK
+    AllowedValues: [zh-HK, zh-CN, zh-TW, en-US]
+
+  BedrockModelId:
+    Type: String
+    Default: us.amazon.nova-2-lite-v1:0
+
+  MiniMaxVoiceId:
+    Type: String
+    Default: "Cantonese_ProfessionalHost（F)"
+
+  MiniMaxTtsModel:
+    Type: String
+    Default: speech-2.8-turbo
+    AllowedValues: [speech-2.8-turbo, speech-2.8-hd]
+
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to access the service (restrict in production)
+
+Mappings:
+  RegionAMI:
+    us-east-1:
+      AMI: ami-0a0e5d9c7acc336f1
+    us-west-2:
+      AMI: ami-05d38da78ce859165
+    ap-northeast-1:
+      AMI: ami-0a290015b99140cd1
+    eu-west-1:
+      AMI: ami-0df368112825f8d8f
+
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ConverseStream
+                  - bedrock:Converse
+                Resource: "*"
+        - PolicyName: TranscribeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - transcribe:StartStreamTranscription
+                  - transcribe:StartStreamTranscriptionWebSocket
+                Resource: "*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} - Cantonese S2S"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ServicePort
+          ToPort: !Ref ServicePort
+          CidrIp: !Ref AllowedCidr
+          Description: WebSocket
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidr
+          Description: SSH
+
+  Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      ImageId: !FindInMap [RegionAMI, !Ref "AWS::Region", AMI]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -ex
+          exec > /var/log/cantonese-s2s-setup.log 2>&1
+
+          # Install Docker + Git
+          apt-get update -qq
+          apt-get install -y -qq docker.io git
+          systemctl enable docker && systemctl start docker
+
+          # Clone repo
+          git clone ${GitRepoUrl} /opt/cantonese-s2s
+          cd /opt/cantonese-s2s
+
+          # Build Docker image
+          docker build -t cantonese-s2s:latest .
+
+          # Write systemd unit
+          cat > /etc/systemd/system/cantonese-s2s.service << 'UNIT'
+          [Unit]
+          Description=Cantonese S2S Service
+          After=docker.service
+          Requires=docker.service
+
+          [Service]
+          Type=simple
+          Restart=always
+          RestartSec=5
+          ExecStartPre=-/usr/bin/docker rm -f cantonese-s2s
+          ExecStart=/usr/bin/docker run --rm --name cantonese-s2s \
+            --network=host \
+            -e MINIMAX_API_KEY=${MiniMaxApiKey} \
+            -e AWS_DEFAULT_REGION=${AWS::Region} \
+            -e BEDROCK_MODEL_ID=${BedrockModelId} \
+            -e TRANSCRIBE_LANGUAGE=${TranscribeLanguage} \
+            -e MINIMAX_VOICE_ID=${MiniMaxVoiceId} \
+            -e MINIMAX_TTS_MODEL=${MiniMaxTtsModel} \
+            -e PORT=${ServicePort} \
+            cantonese-s2s:latest
+          ExecStop=/usr/bin/docker stop cantonese-s2s
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          systemctl daemon-reload
+          systemctl enable cantonese-s2s
+          systemctl start cantonese-s2s
+
+          # Signal CloudFormation success
+          apt-get install -y -qq python3-pip
+          pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz 2>/dev/null || true
+          cfn-signal -e 0 --stack ${AWS::StackName} --resource Instance --region ${AWS::Region} || true
+
+Outputs:
+  WebSocketEndpoint:
+    Description: Nova Sonic v2 compatible WebSocket endpoint
+    Value: !Sub "ws://${Instance.PublicIp}:${ServicePort}/v1/s2s"
+
+  HealthCheck:
+    Description: Health check URL
+    Value: !Sub "http://${Instance.PublicIp}:${ServicePort}/health"
+
+  InstanceId:
+    Value: !Ref Instance
+
+  PublicIP:
+    Value: !GetAtt Instance.PublicIp
+
+  SSH:
+    Value: !Sub "ssh -i ${KeyPairName}.pem ubuntu@${Instance.PublicIp}"
+
+  Logs:
+    Description: View service logs
+    Value: "sudo docker logs -f cantonese-s2s"
+
+  SetupLog:
+    Description: View setup log
+    Value: "cat /var/log/cantonese-s2s-setup.log"
