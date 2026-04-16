@@ -6,7 +6,7 @@ Description: >
 Parameters:
   InstanceType:
     Type: String
-    Default: c5.xlarge
+    Default: t3.large
     AllowedValues: [t3.large, t3.xlarge, c5.large, c5.xlarge, c5.2xlarge, m5.large, m5.xlarge]
     Description: EC2 instance type (CPU only, no GPU needed)
 
